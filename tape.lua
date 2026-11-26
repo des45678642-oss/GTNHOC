@@ -10,7 +10,7 @@
 --   tape play
 --       開啟點唱機介面
 --
--- 每捲磁帶的歌曲索引（曲名、起點、長度）存在磁帶尾端（保留 8192 位元組），
+-- 每捲磁帶的歌曲索引（曲名、起點、長度）存在磁帶開頭（保留 8192 位元組，歌從其後開始），
 -- 不佔電腦硬碟，換電腦也能直接播放。
 --------------------------------------------------------------------------------
 
@@ -23,7 +23,7 @@ local shell         = require("shell")
 local term          = require("term")
 local unicode       = require("unicode")
 
-local INDEX_RESERVE = 8192          -- 磁帶尾端保留給歌曲索引的位元組數
+local INDEX_RESERVE = 8192          -- 磁帶開頭保留給歌曲索引的位元組數
 local INDEX_MAGIC   = "TPIX"
 local BYTES_PER_SEC = 4096          -- 983040 位元組 = 4 分鐘
 local CHUNK         = 8192
@@ -44,14 +44,10 @@ local function absSeek(tape, pos)
   tape.seek(pos - tape.getPosition())
 end
 
-local function dataCapacity(tape)
-  return tape.getSize() - INDEX_RESERVE
-end
-
--- 歌曲索引存在磁帶尾端，不佔電腦硬碟。沒有索引時回傳 nil
+-- 歌曲索引存在磁帶開頭，不佔電腦硬碟。沒有索引時回傳 nil
 local function readIndex(tape)
   local pos = tape.getPosition()
-  absSeek(tape, tape.getSize() - INDEX_RESERVE)
+  absSeek(tape, 0)
   local block = tape.read(INDEX_RESERVE) or ""
   absSeek(tape, pos)
   if block:sub(1, #INDEX_MAGIC) ~= INDEX_MAGIC then return nil end
@@ -67,7 +63,7 @@ local function writeIndex(tape, tracks)
     error("歌太多，索引放不下。")
   end
   tape.stop()
-  absSeek(tape, tape.getSize() - INDEX_RESERVE)
+  absSeek(tape, 0)
   tape.write(INDEX_MAGIC .. string.format("%05d", #text) .. text)
 end
 
@@ -100,12 +96,12 @@ local function write(path, opts)
 
   local tracks = (not opts.new and readIndex(tape)) or {}
   local last = tracks[#tracks]
-  local start = last and (last.start + last.len) or 0
+  local start = last and (last.start + last.len) or INDEX_RESERVE
 
-  if start + size > dataCapacity(tape) then
+  if start + size > tape.getSize() then
     f:close()
     error(string.format("放不下：還剩 %d 位元組，檔案要 %d 位元組。",
-      dataCapacity(tape) - start, size))
+      tape.getSize() - start, size))
   end
 
   tape.stop()
@@ -125,7 +121,7 @@ local function write(path, opts)
   writeIndex(tape, tracks)
 
   print(string.format("已寫入「%s」（第 %d 首，%s）到磁帶「%s」，剩餘 %s。",
-    name, #tracks, fmtTime(total), label, fmtTime(dataCapacity(tape) - start - total)))
+    name, #tracks, fmtTime(total), label, fmtTime(tape.getSize() - start - total)))
   absSeek(tape, 0)
 end
 
@@ -193,12 +189,12 @@ local function pickAndWrite(opts)
   end
 
   -- 容量檢查：算出剩餘空間，放不下的先挑出來
-  local used = 0
+  local used = INDEX_RESERVE
   if existing and #existing > 0 and not startNew then
     local last = existing[#existing]
     used = last.start + last.len
   end
-  local free = dataCapacity(tape) - used
+  local free = tape.getSize() - used
   local fit, total = {}, 0
   for _, i in ipairs(picked) do
     local size = filesystem.size(dir .. "/" .. files[i])
