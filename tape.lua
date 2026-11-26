@@ -160,6 +160,9 @@ local function pickAndWrite(opts)
   local files = scanDir(dir)
   if #files == 0 then print(dir .. " 裡沒有 .dfpwm 檔。") return end
 
+  local tape = getTape()
+  if not tape.isReady() then error("磁帶機裡沒有磁帶。") end
+
   print("在 " .. dir .. " 找到 " .. #files .. " 個檔案：")
   for i, name in ipairs(files) do
     local size = filesystem.size(dir .. "/" .. name)
@@ -170,14 +173,40 @@ local function pickAndWrite(opts)
   if #picked == 0 then print("已取消。") return end
 
   -- 磁帶上已有索引時，問要接在後面還是重寫
-  local tape = getTape()
   local startNew = opts.new
-  local existing = tape.isReady() and loadIndex()[tape.getLabel() or ""]
+  local label = (opts.label and opts.label ~= true) and opts.label or (tape.getLabel() or "")
+  local existing = loadIndex()[label]
   if existing and #existing > 0 and not startNew then
     io.write(string.format("磁帶「%s」已有 %d 首歌，[A]接在後面 / [N]清掉重寫？（預設 A）：",
-      tape.getLabel(), #existing))
+      label, #existing))
     startNew = (io.read() or ""):lower():sub(1, 1) == "n"
   end
+
+  -- 容量檢查：算出剩餘空間，放不下的先挑出來
+  local used = 0
+  if existing and #existing > 0 and not startNew then
+    local last = existing[#existing]
+    used = last.start + last.len
+  end
+  local free = tape.getSize() - used
+  local fit, total = {}, 0
+  for _, i in ipairs(picked) do
+    local size = filesystem.size(dir .. "/" .. files[i])
+    if total + size <= free then
+      fit[#fit + 1] = i
+      total = total + size
+    else
+      print(string.format("放不下：%s（%s），剩餘空間不足。", files[i], fmtTime(size)))
+    end
+  end
+  print(string.format("磁帶剩餘 %s，選了 %d 首，放得下 %d 首（共 %s）。",
+    fmtTime(free), #picked, #fit, fmtTime(total)))
+  if #fit == 0 then print("一首都放不下，已取消。") return end
+  if #fit < #picked then
+    io.write("只寫入放得下的這幾首嗎？[y/N]：")
+    if (io.read() or ""):lower():sub(1, 1) ~= "y" then print("已取消。") return end
+  end
+  picked = fit
 
   for n, i in ipairs(picked) do
     write(dir .. "/" .. files[i], {
