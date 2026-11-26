@@ -2,6 +2,9 @@
 -- tape.lua —— 磁帶機：多首歌寫入 + 點唱機 UI
 --
 -- 用法：
+--   tape write
+--       搜尋 /home/dfpwm（--dir= 可改）列出 .dfpwm，選編號後寫入；
+--       曲名用中文檔名，空白磁帶的標籤也用第一首的檔名
 --   tape write <檔案.dfpwm> [--name=曲名] [--label=磁帶名] [--new]
 --       把一首歌接在磁帶最後面（--new 表示清掉索引，從頭開始寫）
 --   tape play
@@ -13,6 +16,7 @@
 
 local component     = require("component")
 local event         = require("event")
+local filesystem    = require("filesystem")
 local keyboard      = require("keyboard")
 local serialization = require("serialization")
 local shell         = require("shell")
@@ -70,10 +74,15 @@ local function write(path, opts)
   local size = f:seek("end")
   f:seek("set", 0)
 
+  local name = opts.name
+  if not name or name == true then
+    name = (path:match("([^/]+)$") or path):gsub("%.[^.]*$", "")
+  end
+
   local label = opts.label
   if not label or label == true then
     label = tape.getLabel()
-    if not label or label == "" then label = "tape" end
+    if not label or label == "" then label = name end   -- 空白磁帶：用檔名當標籤
   end
 
   local index = loadIndex()
@@ -85,11 +94,6 @@ local function write(path, opts)
     f:close()
     error(string.format("放不下：還剩 %d 位元組，檔案要 %d 位元組。",
       tape.getSize() - start, size))
-  end
-
-  local name = opts.name
-  if not name or name == true then
-    name = (path:match("([^/]+)$") or path):gsub("%.[^.]*$", "")
   end
 
   tape.stop()
@@ -112,6 +116,75 @@ local function write(path, opts)
   print(string.format("已寫入「%s」（第 %d 首，%s）到磁帶「%s」，剩餘 %s。",
     name, #tracks, fmtTime(total), label, fmtTime(tape.getSize() - start - total)))
   absSeek(tape, 0)
+end
+
+--------------------------------------------------------------------------------
+-- 互動選檔寫入：搜尋資料夾、列出、選擇後寫入
+--------------------------------------------------------------------------------
+local DFPWM_DIR = "/home/dfpwm"
+
+local function scanDir(dir)
+  local files = {}
+  if not filesystem.isDirectory(dir) then error("找不到資料夾：" .. dir) end
+  for name in filesystem.list(dir) do
+    if name:lower():match("%.dfpwm$") then files[#files + 1] = name end
+  end
+  table.sort(files)
+  return files
+end
+
+-- 解析「1 3 5」「1-3」「all」
+local function parseSelection(text, max)
+  text = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+  local picked = {}
+  if text == "all" or text == "a" then
+    for i = 1, max do picked[#picked + 1] = i end
+    return picked
+  end
+  for tok in text:gmatch("[^%s,]+") do
+    local a, b = tok:match("^(%d+)-(%d+)$")
+    if a then
+      for i = tonumber(a), tonumber(b) do
+        if i >= 1 and i <= max then picked[#picked + 1] = i end
+      end
+    elseif tonumber(tok) and tonumber(tok) >= 1 and tonumber(tok) <= max then
+      picked[#picked + 1] = tonumber(tok)
+    end
+  end
+  return picked
+end
+
+local function pickAndWrite(opts)
+  local dir = (opts.dir and opts.dir ~= true) and opts.dir or DFPWM_DIR
+  dir = dir:gsub("/+$", "")
+  local files = scanDir(dir)
+  if #files == 0 then print(dir .. " 裡沒有 .dfpwm 檔。") return end
+
+  print("在 " .. dir .. " 找到 " .. #files .. " 個檔案：")
+  for i, name in ipairs(files) do
+    local size = filesystem.size(dir .. "/" .. name)
+    print(string.format("%3d. %s  (%s)", i, name, fmtTime(size)))
+  end
+  io.write("選擇要寫入的編號（例如 1 3 5、1-3、all；直接 Enter 取消）：")
+  local picked = parseSelection(io.read() or "", #files)
+  if #picked == 0 then print("已取消。") return end
+
+  -- 磁帶上已有索引時，問要接在後面還是重寫
+  local tape = getTape()
+  local startNew = opts.new
+  local existing = tape.isReady() and loadIndex()[tape.getLabel() or ""]
+  if existing and #existing > 0 and not startNew then
+    io.write(string.format("磁帶「%s」已有 %d 首歌，[A]接在後面 / [N]清掉重寫？（預設 A）：",
+      tape.getLabel(), #existing))
+    startNew = (io.read() or ""):lower():sub(1, 1) == "n"
+  end
+
+  for n, i in ipairs(picked) do
+    write(dir .. "/" .. files[i], {
+      label = opts.label,
+      new = startNew and n == 1,    -- 只有第一首清索引，後面的接著寫
+    })
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -303,10 +376,13 @@ local args, opts = shell.parse(...)
 local cmd = args[1]
 if cmd == "write" and args[2] then
   write(args[2], opts)
+elseif cmd == "write" then
+  pickAndWrite(opts)
 elseif cmd == "play" then
   play()
 else
   print("用法：")
+  print("  tape write                       搜尋 " .. DFPWM_DIR .. " 並選擇後寫入（--dir=資料夾）")
   print("  tape write <檔案.dfpwm> [--name=曲名] [--label=磁帶名] [--new]")
   print("  tape play")
 end
