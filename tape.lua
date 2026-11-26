@@ -10,8 +10,8 @@
 --   tape play
 --       開啟點唱機介面
 --
--- 每捲磁帶的歌曲索引（曲名、起點、長度）記錄在 INDEX_PATH，以磁帶標籤為鍵，
--- 所以不同的磁帶請用不同的標籤。
+-- 每捲磁帶的歌曲索引（曲名、起點、長度）存在磁帶尾端（保留 8192 位元組），
+-- 不佔電腦硬碟，換電腦也能直接播放。
 --------------------------------------------------------------------------------
 
 local component     = require("component")
@@ -23,7 +23,8 @@ local shell         = require("shell")
 local term          = require("term")
 local unicode       = require("unicode")
 
-local INDEX_PATH    = "/etc/tape_index.cfg"
+local INDEX_RESERVE = 8192          -- 磁帶尾端保留給歌曲索引的位元組數
+local INDEX_MAGIC   = "TPIX"
 local BYTES_PER_SEC = 4096          -- 983040 位元組 = 4 分鐘
 local CHUNK         = 8192
 local TAIL          = 2048          -- 距離歌曲結尾這麼多位元組就換下一首
@@ -38,24 +39,36 @@ local function getTape()
   return component.tape_drive
 end
 
-local function loadIndex()
-  local f = io.open(INDEX_PATH, "r")
-  if not f then return {} end
-  local text = f:read("*a")
-  f:close()
-  local t = serialization.unserialize(text)
-  return type(t) == "table" and t or {}
-end
-
-local function saveIndex(index)
-  local f = assert(io.open(INDEX_PATH, "w"))
-  f:write(serialization.serialize(index))
-  f:close()
-end
-
 -- 磁帶的 seek 是相對移動，這裡包成絕對位置
 local function absSeek(tape, pos)
   tape.seek(pos - tape.getPosition())
+end
+
+local function dataCapacity(tape)
+  return tape.getSize() - INDEX_RESERVE
+end
+
+-- 歌曲索引存在磁帶尾端，不佔電腦硬碟。沒有索引時回傳 nil
+local function readIndex(tape)
+  local pos = tape.getPosition()
+  absSeek(tape, tape.getSize() - INDEX_RESERVE)
+  local block = tape.read(INDEX_RESERVE) or ""
+  absSeek(tape, pos)
+  if block:sub(1, #INDEX_MAGIC) ~= INDEX_MAGIC then return nil end
+  local len = tonumber(block:sub(#INDEX_MAGIC + 1, #INDEX_MAGIC + 5))
+  if not len then return nil end
+  local t = serialization.unserialize(block:sub(#INDEX_MAGIC + 6, #INDEX_MAGIC + 5 + len))
+  return type(t) == "table" and t or nil
+end
+
+local function writeIndex(tape, tracks)
+  local text = serialization.serialize(tracks)
+  if #text > INDEX_RESERVE - #INDEX_MAGIC - 5 then
+    error("歌太多，索引放不下。")
+  end
+  tape.stop()
+  absSeek(tape, tape.getSize() - INDEX_RESERVE)
+  tape.write(INDEX_MAGIC .. string.format("%05d", #text) .. text)
 end
 
 local function fmtTime(bytes)
@@ -85,15 +98,14 @@ local function write(path, opts)
     if not label or label == "" then label = name end   -- 空白磁帶：用檔名當標籤
   end
 
-  local index = loadIndex()
-  local tracks = (not opts.new and index[label]) or {}
+  local tracks = (not opts.new and readIndex(tape)) or {}
   local last = tracks[#tracks]
   local start = last and (last.start + last.len) or 0
 
-  if start + size > tape.getSize() then
+  if start + size > dataCapacity(tape) then
     f:close()
     error(string.format("放不下：還剩 %d 位元組，檔案要 %d 位元組。",
-      tape.getSize() - start, size))
+      dataCapacity(tape) - start, size))
   end
 
   tape.stop()
@@ -110,11 +122,10 @@ local function write(path, opts)
   f:close()
 
   tracks[#tracks + 1] = { name = name, start = start, len = total }
-  index[label] = tracks
-  saveIndex(index)
+  writeIndex(tape, tracks)
 
   print(string.format("已寫入「%s」（第 %d 首，%s）到磁帶「%s」，剩餘 %s。",
-    name, #tracks, fmtTime(total), label, fmtTime(tape.getSize() - start - total)))
+    name, #tracks, fmtTime(total), label, fmtTime(dataCapacity(tape) - start - total)))
   absSeek(tape, 0)
 end
 
@@ -174,11 +185,10 @@ local function pickAndWrite(opts)
 
   -- 磁帶上已有索引時，問要接在後面還是重寫
   local startNew = opts.new
-  local label = (opts.label and opts.label ~= true) and opts.label or (tape.getLabel() or "")
-  local existing = loadIndex()[label]
+  local existing = readIndex(tape)
   if existing and #existing > 0 and not startNew then
     io.write(string.format("磁帶「%s」已有 %d 首歌，[A]接在後面 / [N]清掉重寫？（預設 A）：",
-      label, #existing))
+      tape.getLabel() or "", #existing))
     startNew = (io.read() or ""):lower():sub(1, 1) == "n"
   end
 
@@ -188,7 +198,7 @@ local function pickAndWrite(opts)
     local last = existing[#existing]
     used = last.start + last.len
   end
-  local free = tape.getSize() - used
+  local free = dataCapacity(tape) - used
   local fit, total = {}, 0
   for _, i in ipairs(picked) do
     local size = filesystem.size(dir .. "/" .. files[i])
@@ -225,8 +235,8 @@ local function pad(s, w)
 end
 
 local function loadTracks(tape, label)
-  local tracks = loadIndex()[label]
-  if type(tracks) == "table" and #tracks > 0 then return tracks end
+  local tracks = readIndex(tape)
+  if tracks and #tracks > 0 then return tracks end
   -- 沒有索引的磁帶：整捲當成一首
   return { { name = (label ~= "" and label or "(未命名)"), start = 0, len = tape.getSize() } }
 end
